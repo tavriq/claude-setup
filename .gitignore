@@ -1,0 +1,8 @@
+# секреты и локальное состояние — сюда не должно попадать ничего
+.env
+*.env
+!.env.example
+secrets/
+node_modules/
+tmp/
+.DS_Store
