@@ -75,12 +75,12 @@ git commit -m "<type>(<scope>): <описание>"
 - Без точки в конце
 
 **Примеры:**
-- `feat(mobile): добавлен экран ShiftDetail с фото-прибытием`
-- `fix(backend): исправлена валидация координат в /arrive`
-- `docs: обновлён ONBOARDING под Phase 3.1`
-- `chore(mobile): обновлены peer-deps под RN 0.74`
-- `test(mobile): покрыт useAuth keychain-моком`
-- `refactor(backend): вынесена логика shift-reminders в lib/`
+- `feat(mobile): добавлен экран профиля с аватаром`
+- `fix(backend): исправлена пагинация в /orders`
+- `docs: обновлён README под новый установщик`
+- `chore(mobile): обновлены зависимости`
+- `test(backend): покрыта авторизация по токену`
+- `refactor(backend): вынесена отправка уведомлений в lib/`
 
 ### Шаг 5: Push
 
@@ -92,20 +92,6 @@ git push
 - Если push не прошёл (нет прав, конфликт) → сообщи и предложи решение
 - **Никогда** не делай `git push --force` без явной просьбы {{USER_NAME}}
 - **Никогда** не пушь напрямую в `main`/`master` — только через PR
-
-### Шаг 6: Бэкап .env (опционально)
-
-Если в проекте есть `.env` и настроен бэкап-путь:
-
-```bash
-PROJECT_NAME=$(basename "$PWD")
-BACKUP_DIR="$HOME/Library/Mobile Documents/com~apple~CloudDocs/.env-backups/$PROJECT_NAME"
-mkdir -p "$BACKUP_DIR"
-cp .env "$BACKUP_DIR/.env"
-```
-
-- Если `.env` нет → пропусти этот шаг
-- Путь бэкапа подстрой под пользователя (iCloud, Dropbox, локальная папка)
 
 ---
 
@@ -125,5 +111,4 @@ cp .env "$BACKUP_DIR/.env"
 - [ ] `git add` конкретных файлов (не `.env`, не `tmp/`)
 - [ ] `git commit` в conventional формате на русском
 - [ ] `git push` (если remote настроен)
-- [ ] Бэкап `.env` (если есть и настроен путь)
-- [ ] Рапорт: «Проверил: коммит ✓, push ✓, файлы корректны ✓»
+- [ ] Итог одной строкой: хэш коммита и ветка, куда ушёл push
