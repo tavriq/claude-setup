@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""cc-who — адресная книга локальных сессий Claude Code: имя роли (из /rename) → текущий адрес для SendMessage.
+
+Зачем: после перезапуска редактора сессии получают новые автоматические адреса (myrepo-4c, myrepo-7a…),
+а имя роли, данное через /rename, остаётся только в истории сессии. Сообщение по старому адресу уходит
+не той сессии или никуда. Скрипт сводит реестр живых сессий ~/.claude/sessions/<pid>.json
+с историей ~/.claude/projects/*/<sessionId>.jsonl (записи agent-name и custom-title).
+
+  cc-who              таблица живых сессий: имя, адрес, статус, проект, есть ли контекст
+  cc-who <имя>        адрес сессии (без учёта регистра; точное совпадение, иначе подстрока)
+  cc-who --me         кто я и мой адрес
+  cc-who --hook       для хука SessionStart: говорит сессии, кто она и как искать адресатов
+
+Каталог Claude Code — $CLAUDE_CONFIG_DIR, по умолчанию ~/.claude.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+
+CLAUDE_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+SESSIONS = os.path.join(CLAUDE_HOME, "sessions")
+PROJECTS = os.path.join(CLAUDE_HOME, "projects")
+CACHE = os.path.join(CLAUDE_HOME, "cache", "cc-who.json")
+EMPTY_KB = 20  # история меньше — окно поднято пустым (контекст сброшен)
+STATUS = {"busy": "занят", "idle": "ждёт", "waiting": "ждёт ответа"}
+NAME_TYPES = ("agent-name", "custom-title")
+
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True  # процесс есть, но чужой
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def transcript(sid):
+    hits = glob.glob(os.path.join(PROJECTS, "*", sid + ".jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else None
+
+
+class TitleCache:
+    """История сессии бывает в сотни МБ: файл читается целиком один раз, дальше — только дописанное."""
+
+    def __init__(self, path=CACHE):
+        self.path = path
+        try:
+            self.data = json.loads(open(path, "rb").read().decode("utf-8"))
+        except Exception:
+            self.data = {}
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = f"{self.path}.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+            os.replace(tmp, self.path)  # атомарно: cc-who зовут несколько сессий разом
+        except Exception:
+            pass
+
+    def title(self, path):
+        """Последнее имя от /rename: agent-name, иначе custom-title."""
+        if not path:
+            return ""
+        size = os.path.getsize(path)
+        c = self.data.get(path) or {}
+        start = c.get("off", 0) if c.get("off", 0) <= size else 0  # файл стал короче — читать заново
+        agent, custom = (c.get("agent", ""), c.get("custom", "")) if start else ("", "")
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                chunk = f.read()
+        except OSError:
+            return (agent or custom).strip()
+        done = chunk.rfind(b"\n") + 1  # недописанную последнюю строку оставляем на следующий раз
+        for line in chunk[:done].split(b"\n"):
+            if b"agent-name" not in line and b"custom-title" not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("type") == "agent-name" and rec.get("agentName"):
+                agent = rec["agentName"]
+            elif rec.get("type") == "custom-title" and rec.get("customTitle"):
+                custom = rec["customTitle"]
+        self.data[path] = {"off": start + done, "agent": agent, "custom": custom}
+        return (agent or custom).strip()
+
+
+def load():
+    cache = TitleCache()
+    rows = []
+    for f in glob.glob(os.path.join(SESSIONS, "*.json")):
+        try:
+            with open(f, encoding="utf-8") as fh:
+                d = json.load(fh)
+        except Exception:
+            continue
+        if not alive(d.get("pid")):
+            continue
+        sid = d.get("sessionId", "")
+        tp = transcript(sid) if sid else None
+        title = cache.title(tp)
+        if not title and d.get("nameSource") == "user":
+            title = d.get("name", "")  # после /clear история новая, а имя от /rename у адреса осталось
+        rows.append({
+            "pid": d.get("pid"), "sid": sid, "title": title, "addr": d.get("name", ""),
+            "status": d.get("status", ""), "project": os.path.basename((d.get("cwd") or "").rstrip("/")),
+            "ctx": "пустой" if not tp or os.path.getsize(tp) // 1024 < EMPTY_KB else "есть",
+        })
+    cache.save()
+    titles = [r["title"].lower() for r in rows if r["title"]]
+    for r in rows:
+        r["dup"] = bool(r["title"]) and titles.count(r["title"].lower()) > 1
+    return rows
+
+
+def find_me(rows, sid=None):
+    sid = sid or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    for r in rows:
+        if sid and r["sid"] == sid:
+            return r
+    pid = os.getppid()  # запасной путь: вверх по родителям до процесса сессии
+    for _ in range(8):
+        for r in rows:
+            if r["pid"] == pid:
+                return r
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+            pid = int(out.stdout.strip() or 0)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            break
+        if pid <= 1:
+            break
+    return None
+
+
+def find(rows, query):
+    q = query.strip().lower()
+    exact = [r for r in rows if r["title"].lower() == q]
+    return exact or [r for r in rows if q and q in r["title"].lower()]
+
+
+def table(rows):
+    rows = sorted(rows, key=lambda r: (r["project"], r["title"] == "", r["title"].lower(), r["addr"]))
+    w = max([len(r["title"] or "(без имени)") + 7 * r["dup"] for r in rows] + [8])
+    a = max([len(r["addr"]) for r in rows] + [5])
+    print(f"{'имя':<{w}}  {'адрес':<{a}}  {'статус':<11}  {'проект':<20}  контекст")
+    for r in rows:
+        name = (r["title"] or "(без имени)") + (" ⚠дубль" if r["dup"] else "")
+        print(f"{name:<{w}}  {r['addr']:<{a}}  {STATUS.get(r['status'], r['status']):<11}  {r['project']:<20}  {r['ctx']}")
+
+
+def hook():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    sid = payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    me = find_me(load(), sid)
+    name = me["title"] if me else ""
+    who = f"Ты — «{name}»" if name else "У тебя нет имени роли (его даёт человек через /rename)"
+    where = f", адрес для SendMessage сейчас: {me['addr']}" if me and me["addr"] else ""
+    self_path = os.path.realpath(__file__)
+    text = (f"{who}{where}. Адреса сессий меняются после каждого перезапуска: перед SendMessage бери адрес "
+            f"командой `{self_path} <имя>`, карта всех сессий — `{self_path}`. Адреса из памяти и старых "
+            f"сообщений не использовать.")
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}},
+                     ensure_ascii=False))
+
+
+def main(argv):
+    if argv[:1] == ["--hook"]:
+        try:
+            hook()
+        except Exception:
+            pass  # хук не должен ронять старт сессии
+        return 0
+    rows = load()
+    if not argv:
+        table(rows)
+        return 0
+    if argv[0] == "--me":
+        me = find_me(rows)
+        if not me:
+            print("себя в реестре не нашёл", file=sys.stderr)
+            return 1
+        print(f"ты — {me['title'] or '(без имени)'}, адрес {me['addr']}")
+        return 0
+    query = " ".join(argv)
+    hits = find(rows, query)
+    if not hits:
+        print(f"нет живой сессии с именем «{query}». Карта: cc-who", file=sys.stderr)
+        return 1
+    if len(hits) > 1:
+        print("несколько совпадений, уточни:", file=sys.stderr)
+        for r in hits:
+            print(f"  {r['title']}  →  {r['addr']}  ({r['project']})", file=sys.stderr)
+        return 2
+    print(hits[0]["addr"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,73 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *:*)"
+    ]
+  },
+  "model": "opus[1m]",
+  "effortLevel": "xhigh",
+  "autoCompactEnabled": true,
+  "switchModelsOnFlag": false,
+  "crossSessionInbound": "accept",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/bin/cc-who --hook",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "find ~/.claude/handoff -name '*.md' -mtime +7 -delete 2>/dev/null; exit 0",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/bin/check-hooks-config --hook",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/bash-guard.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/context-warn.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "afplay /System/Library/Sounds/Glass.aiff"
+          }
+        ]
+      }
+    ]
+  }
+}

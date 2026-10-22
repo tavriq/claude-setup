@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""check-hooks-config — ищет в настройках Claude Code хуки, которые молча не работают.
+
+Типичный случай: в matcher пишут `Bash(git push:*)`. Matcher — регулярка по имени тула, а имя
+у тула просто «Bash», поэтому хук не вызывается ни разу и ошибки при этом тоже нет.
+Отбирать по тексту команды нужно полем `if` у самого хука или внутри скрипта.
+
+Что смотрит в settings.json и settings.local.json — пользовательских и в корне git-проекта:
+  - файл разбирается как JSON: битый файл выключает разом все свои настройки;
+  - у событий про тулы в matcher только имена тулов, без скобок и опечаток;
+  - у SessionStart и PreCompact в matcher только значения этого события;
+  - `if` записан как `Tool` или `Tool(шаблон)`;
+  - команда хука ведёт к файлу: после интерпретатора (`python3 x.py`) — к скрипту, без него —
+    к исполняемому файлу или программе из PATH. Относительный путь считается от корня проекта.
+Хуки не запускает и ничего не пишет.
+
+  check-hooks-config [каталог …]   по умолчанию текущий; код выхода 1 — есть находки
+  check-hooks-config --hook        для SessionStart: находки уходят в systemMessage, иначе тишина
+Каталог настроек — $CLAUDE_CONFIG_DIR или ~/.claude.
+"""
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+SETTINGS_NAMES = ("settings.json", "settings.local.json")
+
+# События, где matcher сравнивается с именем тула.
+TOOL_MATCHED = frozenset("PreToolUse PostToolUse PostToolUseFailure PermissionRequest PermissionDenied".split())
+# События со своим набором значений matcher.
+EVENT_VALUES = {
+    "SessionStart": frozenset("startup resume clear compact".split()),
+    "PreCompact": frozenset("manual auto".split()),
+}
+# Встроенные тулы. Набор меняется от версии к версии Claude Code: если линтер принял новый тул
+# за опечатку, впиши его сюда.
+TOOLS = frozenset("""
+    Agent AskUserQuestion Bash BashOutput CronCreate CronDelete CronList Edit EnterPlanMode
+    EnterWorktree ExitPlanMode ExitWorktree Glob Grep KillBash KillShell LS LSP ListAgents
+    Monitor MultiEdit NotebookEdit NotebookRead PushNotification Read RemoteTrigger
+    ScheduleWakeup SendMessage Skill SlashCommand Task TaskCreate TaskGet TaskList TaskOutput
+    TaskStop TaskUpdate TodoRead TodoWrite ToolSearch WebFetch WebSearch Workflow Write
+""".split())
+RUNNERS = frozenset("sh bash zsh dash node perl ruby deno bun".split())  # и python, python3, python3.12…
+INLINE_CODE = frozenset(("-c", "-e", "-m", "--eval"))  # код строкой или модуль: файла нет
+CHAIN = frozenset(("&&", "||", ";", "|", "&"))
+IF_FORM = re.compile(r"[A-Za-z_]\w*(?:\(.*\))?", re.S)
+VARS_IN_COMMAND = re.compile(r"\$\{?(CLAUDE_PROJECT_DIR|HOME)\}?")
+
+
+def git_toplevel(start):
+    """Корень git-проекта, в котором лежит start; вне git — сам start."""
+    try:
+        res = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return Path(start)
+    top = res.stdout.strip()
+    return Path(top) if res.returncode == 0 and top else Path(start)
+
+
+def tilde(path):
+    home, text = str(Path.home()), str(path)
+    return "~" + text[len(home):] if text == home or text.startswith(home + os.sep) else text
+
+
+def is_assignment(word):
+    name, eq, _ = word.partition("=")
+    return bool(eq) and name.isidentifier()
+
+
+# ---------- проверки ----------
+
+def matcher_problem(event, matcher):
+    if matcher in ("", "*"):
+        return None
+    if event in TOOL_MATCHED:
+        return tool_matcher_problem(matcher)
+    values = EVENT_VALUES.get(event)
+    if values is None:
+        return None
+    unknown = [v for v in matcher.split("|") if v not in values]
+    if not unknown:
+        return None
+    return (f"matcher «{matcher}»: нет значений {', '.join(unknown)} у {event}; "
+            f"допустимы {', '.join(sorted(values))}")
+
+
+def tool_matcher_problem(matcher):
+    head, paren, _ = matcher.partition("(")
+    if paren:
+        return (f"matcher «{matcher}» сравнивается только с именем тула, хук не сработает никогда. "
+                f"Нужно: matcher «{head}», а «{matcher}» перенести в поле if хука (или отбирать в скрипте)")
+    try:
+        re.compile(matcher)
+    except re.error as err:
+        return f"matcher «{matcher}» не компилируется как регулярка: {err}"
+    for name in matcher.split("|"):
+        if name.isidentifier() and name not in TOOLS and not name.startswith("mcp__"):
+            return f"matcher «{matcher}»: нет тула «{name}» — опечатка или новый тул (тогда впиши его в TOOLS)"
+    return None
+
+
+def if_problem(cond):
+    if IF_FORM.fullmatch(cond):
+        return None
+    return f"if «{cond}» записан не по форме «Tool» или «Tool(шаблон)»"
+
+
+def first_command(words):
+    """Слова первой команды в цепочке без VAR=… впереди и без обёртки env."""
+    cmd = []
+    for word in words:
+        if word in CHAIN:
+            break
+        cmd.append(word)
+    while cmd and is_assignment(cmd[0]):
+        cmd.pop(0)
+    if cmd and os.path.basename(cmd[0]) == "env":
+        cmd.pop(0)
+        while cmd and (cmd[0].startswith("-") or is_assignment(cmd[0])):
+            cmd.pop(0)
+    return cmd
+
+
+def in_project(word, project):
+    path = Path(os.path.expanduser(word))
+    return path if path.is_absolute() else project / path
+
+
+def script_problem(args, project):
+    """Аргументы интерпретатора: первый не-флаг — скрипт."""
+    for arg in args:
+        if arg in INLINE_CODE:
+            return None
+        if arg.startswith("-"):
+            continue
+        script = in_project(arg, project)
+        return None if script.exists() else f"нет скрипта {tilde(script)}"
+    return None
+
+
+def command_problem(command, project):
+    expanded = VARS_IN_COMMAND.sub(
+        lambda m: str(project) if m.group(1) == "CLAUDE_PROJECT_DIR" else str(Path.home()), command)
+    try:
+        argv = first_command(shlex.split(expanded))
+    except ValueError:
+        return "команда не разбирается: незакрытая кавычка?"
+    if not argv:
+        return None
+    prog = argv[0]
+    has_path = os.sep in prog or prog.startswith("~")
+    if has_path:
+        target = in_project(prog, project)
+        if not target.exists():
+            return f"нет файла {tilde(target)}"
+    elif shutil.which(prog) is None:
+        return f"нет в PATH: {prog}"
+    name = os.path.basename(prog)
+    if name in RUNNERS or re.fullmatch(r"python[\d.]*", name):
+        return script_problem(argv[1:], project)
+    if has_path and not os.access(target, os.X_OK):
+        return f"файл не исполняемый: {tilde(target)} — chmod +x или интерпретатор перед ним"
+    return None
+
+
+def hook_problems(hook, project):
+    if not isinstance(hook, dict):
+        return
+    cond = hook.get("if")
+    if cond:
+        problem = if_problem(cond)
+        if problem:
+            yield problem
+    command = hook.get("command")
+    if hook.get("type", "command") == "command" and command:
+        problem = command_problem(command, project)
+        if problem:
+            yield f"«{command[:80]}»: {problem}"
+
+
+def lint_settings(path, project):
+    """Находки по одному файлу настроек; файла нет — находок нет."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as err:
+        return [f"{tilde(path)}: JSON не читается ({type(err).__name__}), ни одна настройка файла не действует"]
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if hooks is not None and type(hooks) is not dict:
+        return [f"{tilde(path)}: поле hooks должно быть объектом"]
+    found = []
+    for event in hooks or {}:
+        groups = hooks[event]
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict):
+                continue
+            where = f"{tilde(path)}: {event}"
+            problem = matcher_problem(event, group.get("matcher") or "")
+            if problem:
+                found.append(f"{where} {problem}")
+            found += [f"{where} {p}" for hook in group.get("hooks") or [] for p in hook_problems(hook, project)]
+    return found
+
+
+def settings_files(start):
+    """(корень проекта, файлы настроек без повторов): сначала пользовательские, потом проекта."""
+    project = git_toplevel(start)
+    files, seen = [], set()
+    for path in [CONFIG_DIR / n for n in SETTINGS_NAMES] + [project / ".claude" / n for n in SETTINGS_NAMES]:
+        key = path.resolve()
+        if key not in seen:  # проект — сам ~/.claude или домашний каталог
+            seen.add(key)
+            files.append(path)
+    return project, files
+
+
+def lint(start):
+    project, files = settings_files(Path(start).resolve())
+    return [problem for path in files for problem in lint_settings(path, project)]
+
+
+# ---------- запуск ----------
+
+def run_as_hook():
+    try:
+        payload = json.load(sys.stdin)
+    except ValueError:
+        payload = {}
+    start = payload.get("cwd") if isinstance(payload, dict) else None
+    found = lint(start or os.getcwd())
+    if found:
+        text = "check-hooks-config — эти хуки не сработают:\n" + "\n".join("- " + f for f in found)
+        print(json.dumps({"systemMessage": text}, ensure_ascii=False))
+
+
+def main(args):
+    if args[:1] == ["--hook"]:
+        try:
+            run_as_hook()
+        except Exception:  # старт сессии важнее линтера
+            pass
+        return 0
+    targets = args or [os.getcwd()]
+    many = len(targets) > 1
+    total = 0
+    for target in targets:
+        found = lint(target)
+        total += len(found)
+        if many:
+            print(f"== {tilde(git_toplevel(Path(target).resolve()))}: {len(found) or 'чисто'}")
+        for problem in found:
+            print(("   " if many else "") + problem)
+    return 1 if total else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

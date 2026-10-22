@@ -1,0 +1,37 @@
+{
+  "prod_hosts": ["203.0.113.10"],
+  "protected_branches": ["main", "master", "dev"],
+  "safe_rm_dirs": ["node_modules", "dist", "build", "tmp", ".cache", "coverage", "__pycache__"],
+  "rules": [
+    {
+      "id": "gh-protection",
+      "level": "block",
+      "match": "(^|[\\s/])gh\\s+api\\b(?!\\s+graphql)(?=.*(/protection\\b|/rulesets\\b))(?!.*(\\s-X\\s*GET\\b|\\s--method[\\s=]GET\\b))(?=.*(\\s-X\\s*(PUT|POST|PATCH|DELETE)\\b|\\s--method[\\s=](PUT|POST|PATCH|DELETE)\\b|\\s-[fF]\\s|\\s--field\\b|\\s--raw-field\\b|\\s--input\\b))",
+      "msg": "смена защиты веток GitHub — только руками человека; чтение: gh api -X GET"
+    },
+    {
+      "id": "gh-protection-graphql",
+      "level": "block",
+      "match": "(^|[\\s/])gh\\s+api\\s+graphql\\b.*\\b(delete|update|create)(BranchProtectionRule|RepositoryRuleset)\\b",
+      "msg": "смена защиты веток через GraphQL — только руками человека"
+    },
+    {
+      "id": "push-no-verify",
+      "level": "confirm",
+      "match": "(^|[\\s/])git\\b.*\\spush\\b.*\\s--no-verify\\b",
+      "msg": "git push --no-verify пропускает локальные проверки"
+    },
+    {
+      "id": "ssh-known-hosts-remove",
+      "level": "confirm",
+      "match": "(^|[\\s/])ssh-keygen\\b.*\\s-R\\b",
+      "msg": "ssh-keygen -R стирает ключ хоста: если ключ сменился, сначала выясни почему"
+    },
+    {
+      "id": "ssh-hostkey-check-off",
+      "level": "confirm",
+      "match": "(StrictHostKeyChecking[\\s=]+(no|off|accept-new)\\b|UserKnownHostsFile[\\s=]+/dev/null\\b)",
+      "msg": "проверка ключа хоста выключена: так подменённый сервер примут за свой"
+    }
+  ]
+}
