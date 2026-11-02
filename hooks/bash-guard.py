@@ -741,6 +741,9 @@ def check_git(pr, seg, argv, cfg, env, hit):
         refs, dests, deleted, _ = push_targets(pr, seg, rest, cdir)
         if force or any(r.startswith("+") for r in refs):
             hit("block", "push-force", "git push --force перезаписывает чужую историю; нужно — --force-with-lease и не в защищённые ветки")
+        elif "--mirror" in rest:
+            hit("block", "push-mirror", "git push --mirror перезаписывает все ветки на сервере как force и удаляет те, "
+                                        "которых нет локально; нужна ветка — пушь её по имени")
         elif lease and dests & protected:
             hit("block", "push-lease-protected", f"--force-with-lease в {', '.join(sorted(dests & protected))}")
         if deleted & protected:
