@@ -18,18 +18,13 @@ description: Git worktrees — создание/управление, convention
 
 **Префикс:** `feat/<name>` (conventional naming, стандарт для PR-флоу).
 
-**Базовая ветка (от чего ответвлять):** автодетект в этом порядке:
-1. `dev` (если существует)
-2. `main` (если существует)
-3. `master` (если существует)
-4. Текущая ветка (если выше не нашлось)
+**Базовая ветка (от чего ответвлять)** — первая существующая, локально или в `origin`:
+1. `dev`
+2. `main`
+3. `master`
+4. Текущая ветка (если выше не нашлось; скрипт об этом предупредит)
 
-```bash
-BASE=$(git show-ref --verify --quiet refs/heads/dev && echo dev \
-  || git show-ref --verify --quiet refs/heads/main && echo main \
-  || git show-ref --verify --quiet refs/heads/master && echo master \
-  || git branch --show-current)
-```
+Базу выбирает и worktree создаёт скрипт `new-worktree.sh` рядом с этим файлом. Не собирай команду руками: цепочка `a && echo dev || b && echo main || …` в shell выдаёт несколько веток сразу, и worktree не создаётся.
 
 ## Операции
 
@@ -38,30 +33,24 @@ BASE=$(git show-ref --verify --quiet refs/heads/dev && echo dev \
 **Аргумент:** `$ARGUMENTS` = имя worktree (например: `chat-screen`, `auth-refactor`, `experiment-fcm`).
 
 ```bash
-# Убедиться что .claude/worktrees/ в .gitignore
-grep -q '.claude/worktrees/' .gitignore 2>/dev/null || echo '.claude/worktrees/' >> .gitignore
-
-# Определить базовую ветку
-BASE=$(git show-ref --verify --quiet refs/heads/dev && echo dev \
-  || git show-ref --verify --quiet refs/heads/main && echo main \
-  || git show-ref --verify --quiet refs/heads/master && echo master \
-  || git branch --show-current)
-
-# Подтянуть свежий base, если есть upstream
-git fetch origin "$BASE" 2>/dev/null || true
-
-# Создать worktree с веткой feat/<name> от base
-git worktree add .claude/worktrees/$ARGUMENTS -b feat/$ARGUMENTS "$BASE"
+bash ~/.claude/skills/worktree/new-worktree.sh "$ARGUMENTS"
 ```
 
-После создания сообщи {{USER_NAME}}:
+Скрипт:
+- переходит в корень главного дерева, если есть `origin` — делает `git fetch`;
+- выбирает базу (см. выше) и ответвляет `feat/$ARGUMENTS` от свежего `origin/<база>`, а без remote — от локальной `<база>`;
+- upstream не ставит: голый `git push` не уйдёт в базу, первый push — `git push -u origin feat/$ARGUMENTS`;
+- дописывает `.claude/worktrees/` в `.gitignore`, если строки нет;
+- печатает папку, ветку и базу. Упал — покажи {{USER_NAME}} его вывод, не обходи вручную.
+
+После создания сообщи {{USER_NAME}} по выводу скрипта:
 ```
 Worktree "$ARGUMENTS" создан:
 - Папка: .claude/worktrees/$ARGUMENTS/
-- Ветка: feat/$ARGUMENTS (от $BASE)
+- Ветка: feat/$ARGUMENTS (от <база>)
 - Все мои действия теперь будут в этой папке.
 
-Когда закончу — скажи «смержи worktree $ARGUMENTS» чтобы влить через PR в $BASE.
+Когда закончу — скажи «смержи worktree $ARGUMENTS» чтобы влить через PR в <база>.
 ```
 
 **После создания — ПЕРЕКЛЮЧИСЬ на работу в worktree:**
@@ -96,9 +85,9 @@ cd .claude/worktrees/$ARGUMENTS && git commit -m "feat(<scope>): описани�
 cd .claude/worktrees/$ARGUMENTS && git push -u origin feat/$ARGUMENTS
 ```
 
-Если есть `gh` CLI и remote — открой PR:
+Если есть `gh` CLI и remote — открой PR в базу, которую назвал `new-worktree.sh` при создании:
 ```bash
-cd .claude/worktrees/$ARGUMENTS && gh pr create --base $BASE --title "feat(<scope>): worktree $ARGUMENTS" --body "..."
+cd .claude/worktrees/$ARGUMENTS && gh pr create --base <база> --title "feat(<scope>): worktree $ARGUMENTS" --body "..."
 ```
 
 **Прямой merge без PR — только если {{USER_NAME}} явно попросил «смержи без PR»:**
@@ -106,7 +95,7 @@ cd .claude/worktrees/$ARGUMENTS && gh pr create --base $BASE --title "feat(<scop
 cd <корень_проекта> && git merge feat/$ARGUMENTS --no-edit
 ```
 
-После успешного merge/PR спроси: «Удалить worktree $ARGUMENTS? Изменения уже в $BASE (или ждут review в PR).»
+После успешного merge/PR спроси: «Удалить worktree $ARGUMENTS? Изменения уже в <база> (или ждут review в PR).»
 
 ### 4. Удалить worktree
 
