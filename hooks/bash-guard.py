@@ -17,9 +17,13 @@ eval, ssh <хост> '…' (и heredoc в ssh/bash), docker exec, find -exec. cd
 для следующих команд.
 
 Конфиг: ~/.claude/bash-guard.json и <корень репо>/.claude/bash-guard.json (образец —
-bash-guard.example.json). Лог: ~/.claude/logs/bash-guard.jsonl, секреты в команде маскируются.
+bash-guard.example.json). Правило в rules — либо match (регулярка по тексту простой команды без
+текстов коммитов и PR), либо push_to (ветки: срабатывает git push, который отправит в них, —
+по refspec, HEAD, голому push по текущей ветке дерева, --all/--mirror).
+Лог: ~/.claude/logs/bash-guard.jsonl, секреты в команде маскируются.
 Выключатель: файл ~/.claude/bash-guard.off. Сбой разбора или битый конфиг — пропуск (fail-open):
-страж не должен останавливать работу из-за своей ошибки, от поломки страхуют тесты.
+страж не должен останавливать работу из-за своей ошибки. Сбой пишется в лог записью
+decision=error с командой и текстом ошибки; от поломки страхуют тесты.
 
 Тесты: python3 -m unittest discover -s tests
 """
@@ -29,6 +33,7 @@ import os
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 
 HOME = str(Path.home())
@@ -692,6 +697,38 @@ def check_rm(pr, seg, args, cfg, env, remote, on_prod, host, hit):
         hit("confirm", "rm-r", f"rm -r вне временных каталогов и сборки: {shown}")
 
 
+def push_targets(pr, seg, rest, cdir):
+    """Куда уйдёт git push: (refspec'и, ветки-назначения, удаляемые ветки, все ли ветки разом).
+    Без refspec — текущая ветка дерева (push.default simple/current), HEAD и @ — тоже она.
+    --tags без refspec веток не трогает; --all, --branches и --mirror трогают все."""
+    refs = [a for a in rest if not a.startswith("-")][1:]  # первый — remote
+    branch = current_branch(pr.resolve(seg, cdir) if cdir else seg.cwd) if seg.host is None else None
+
+    def dest(ref):
+        d = ref.lstrip("+").split(":")[-1]
+        d = d[len("refs/heads/"):] if d.startswith("refs/heads/") else d
+        return branch if d in ("HEAD", "@") else d
+
+    named = {dest(r) for r in refs}
+    deleted = {dest(r) for r in refs if r.startswith(":")}
+    if "--delete" in rest or "-d" in rest:
+        deleted |= named
+    dests = named if refs else (set() if "--tags" in rest else {branch})
+    every = bool({"--all", "--branches", "--mirror"} & set(rest))
+    return refs, dests - {None}, deleted - {None}, every
+
+
+def git_push_of(pr, seg):
+    """Для git push — (ветки-назначения, все ли ветки разом), иначе None."""
+    if not seg.argv or os.path.basename(seg.argv[0]) != "git":
+        return None
+    sub, rest, cdir = git_subcommand(seg.argv)
+    if sub != "push":
+        return None
+    _, dests, _, every = push_targets(pr, seg, rest, cdir)
+    return dests, every
+
+
 def check_git(pr, seg, argv, cfg, env, hit):
     sub, rest, cdir = git_subcommand(argv)
     if sub is None:
@@ -701,17 +738,11 @@ def check_git(pr, seg, argv, cfg, env, hit):
     if sub == "push":
         force = "--force" in rest or has_short_flag(rest, "f")
         lease = any(a.startswith("--force-with-lease") for a in rest)
-        delete = "--delete" in rest or "-d" in rest
-        refs = [a for a in rest if not a.startswith("-")][1:]  # первый — remote
-        dests = [r.lstrip("+").split(":")[-1].replace("refs/heads/", "") for r in refs]
-        deleted = {r[1:] for r in refs if r.startswith(":")} | (set(dests) if delete else set())
-        if not dests and seg.host is None:
-            branch = current_branch(where)
-            dests = [branch] if branch else []
+        refs, dests, deleted, _ = push_targets(pr, seg, rest, cdir)
         if force or any(r.startswith("+") for r in refs):
             hit("block", "push-force", "git push --force перезаписывает чужую историю; нужно — --force-with-lease и не в защищённые ветки")
-        elif lease and set(dests) & protected:
-            hit("block", "push-lease-protected", f"--force-with-lease в {', '.join(sorted(set(dests) & protected))}")
+        elif lease and dests & protected:
+            hit("block", "push-lease-protected", f"--force-with-lease в {', '.join(sorted(dests & protected))}")
         if deleted & protected:
             hit("block", "push-delete-protected", f"удаление ветки {', '.join(sorted(deleted & protected))}")
         return
@@ -792,11 +823,33 @@ def config_rules(cfg, pr, cwd, env):
     compiled = []
     for r in rules:
         try:
-            if r.get("level") in LEVELS and r.get("match"):
-                compiled.append((r["level"], r.get("id") or r["match"][:30], r.get("msg") or "", re.compile(r["match"])))
+            if r.get("level") not in LEVELS:
+                continue
+            if r.get("match"):
+                compiled.append((r["level"], r.get("id") or r["match"][:30], r.get("msg") or "",
+                                 regex_rule(re.compile(r["match"]))))
+            elif r.get("push_to"):
+                branches = r["push_to"]
+                branches = frozenset([branches] if isinstance(branches, str) else branches)
+                compiled.append((r["level"], r.get("id") or "push-to",
+                                 r.get("msg") or f"git push в {', '.join(sorted(map(str, branches)))}",
+                                 push_rule(branches)))
         except (re.error, AttributeError, TypeError):
             pass  # одно битое правило не отключает остальные
     return compiled
+
+
+def regex_rule(rx):
+    """match: регулярка по тексту простой команды без текстов коммитов и PR (echo/printf не смотрим)."""
+    return lambda pr, seg, view: view is not None and rx.search(view) is not None
+
+
+def push_rule(branches):
+    """push_to: git push, который отправит в одну из веток (refspec, HEAD, голый push, --all/--mirror)."""
+    def fits(pr, seg, view):
+        push = git_push_of(pr, seg)
+        return push is not None and (push[1] or bool(push[0] & branches))
+    return fits
 
 
 # ---------- решение ----------
@@ -820,10 +873,8 @@ def decide(cmd, cwd, cfg=None, env=None, ssh_config=SSH_CONFIG):
     rules = config_rules(cfg, pr, cwd, env)
     for seg in pr.segments:
         view = text_free_view(seg.argv)
-        if view is None:
-            continue
-        for level, rid, msg, rx in rules:
-            if rx.search(view):
+        for level, rid, msg, fits in rules:
+            if fits(pr, seg, view):
                 hits.append((level, rid, msg or f"правило {rid}"))
     m = MARKER.search(cmd)
     quote = m.group(1).strip() if m else None
@@ -867,14 +918,22 @@ def main():
     cwd = data.get("cwd") or os.getcwd()
     if not cmd or os.path.exists(OFF_PATH):
         return
+
+    def log(decision, rules=(), quote=None, **extra):
+        write_log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": data.get("session_id"), "cwd": cwd,
+                   "decision": decision, "rules": list(rules), "quote": quote, **extra, "cmd": masked(cmd)[:600]})
+
     try:
         verdict, hits, quote = decide(cmd, cwd)
-    except Exception:
-        return  # fail-open
+    except Exception as e:
+        # fail-open: из-за своей ошибки страж работу не останавливает, но след оставляет
+        frames = traceback.extract_tb(e.__traceback__)
+        at = f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno} {frames[-1].name}" if frames else ""
+        log("error", error=masked(f"{type(e).__name__}: {e}")[:300], at=at)
+        return
     if verdict == "allow":
         return
-    write_log({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "session": data.get("session_id"), "cwd": cwd,
-               "decision": verdict, "rules": [h[1] for h in hits], "quote": quote, "cmd": masked(cmd)[:600]})
+    log(verdict, [h[1] for h in hits], quote)
     top = next(h for level in ("block", "confirm", "ask") for h in hits if h[0] == level)
     if verdict == "block":
         reply("deny", f"bash-guard [{top[1]}]: {top[2]}. Блок маркером не снимается: если это нужно, "

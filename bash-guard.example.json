@@ -16,6 +16,12 @@
       "msg": "смена защиты веток через GraphQL — только руками человека"
     },
     {
+      "id": "push-main",
+      "level": "confirm",
+      "push_to": ["main", "master"],
+      "msg": "git push в main/master: в основную ветку — через PR; напрямую только по согласию человека"
+    },
+    {
       "id": "push-no-verify",
       "level": "confirm",
       "match": "(^|[\\s/])git\\b.*\\spush\\b.*\\s--no-verify\\b",
