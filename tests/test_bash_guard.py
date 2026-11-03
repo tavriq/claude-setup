@@ -87,6 +87,11 @@ CASES = [
     (R, "git push origin --delete dev", "block"),
     (R, "git push origin :main", "block"),
     (R, "git -C ../wt push --force-with-lease origin dev", "block"),
+    (W, "git push --mirror origin", "block"),
+    (W, "git push --mirror", "block"),
+    (R, "git -C ../wt push --mirror origin", "block"),
+    (W, "git push --mirror origin #danger-ok: зеркаль", "block"),
+    (R, "bash -c 'git push --mirror backup'", "block"),
     (R, "echo TOKEN=2 > backend/.env", "block"),
     (R, "cd backend && echo TOKEN=2 >> .env", "block"),
     (R, "cp /tmp/x backend/.env", "block"),
@@ -132,12 +137,28 @@ CASES = [
     (R, "npm publish", "confirm"),
     (W, "npm publish", "confirm"),
     (R, "git push --no-verify origin feat/x", "confirm"),
+    # push в main/master (правило push-main из образца): R на main, W на feat/x
+    (R, "git push origin main", "confirm"),
+    (R, "git push -u origin master", "confirm"),
+    (R, "git push origin HEAD:main", "confirm"),
+    (R, "git push origin feat/x:refs/heads/master", "confirm"),
+    (R, "git push", "confirm"),
+    (R, "git push origin HEAD", "confirm"),
+    (R, "git push -u origin @", "confirm"),
+    (R, "git push --all origin", "confirm"),
+    (W, "git -C ../repo push", "confirm"),
+    (W, "cd ../repo && git push", "confirm"),
+    (W, "git push origin feat/x && git push origin main", "confirm"),
+    (R, "bash -c 'git push origin main'", "confirm"),
+    (R, "ssh build-box 'cd /srv/app && git push origin main'", "confirm"),
+    (R, "git push --force-with-lease origin HEAD", "block"),
     (R, "ssh-keygen -R build-box", "confirm"),
     (R, "ssh -o StrictHostKeyChecking=no build-box uptime", "confirm"),
     # --- marker: confirm с цитатой проходит и пишется в лог ---
     (R, "git reset --hard #danger-ok: да, сбрось к origin", "marker"),
     (R, "rm -rf src #danger-ok: удаляй src целиком", "marker"),
     (R, "cat backend/.env #danger-ok: покажи ключи", "marker"),
+    (R, "git push origin main #danger-ok: пушь в main", "marker"),
     # --- ask: окно человеку ---
     (R, "echo bash-guard-ask-probe", "ask"),
     (R, "ssh prod-alias 'pm2 restart api'", "ask"),
@@ -155,6 +176,14 @@ CASES = [
     (os.path.join(R, "src"), "rm -rf ../dist", "allow"),
     (R, "git push origin feat/x", "allow"),
     (W, "git push", "allow"),
+    (W, "git push -u origin HEAD", "allow"),
+    (R, "git push origin feat/main-screen", "allow"),
+    (R, "git push origin main-fix", "allow"),
+    (R, "git push origin main:feat/x", "allow"),
+    (R, "git push origin --tags", "allow"),
+    (R, "git log origin/main..main", "allow"),
+    (R, "echo git push origin main", "allow"),
+    (R, "git commit -m 'потом git push origin main'", "allow"),
     (W, "git push --force-with-lease", "allow"),
     (R, "git reset --soft HEAD~1", "allow"),
     (R, "git branch -d feat/x", "allow"),
@@ -201,6 +230,31 @@ class Table(unittest.TestCase):
         rules = [r[1] for r in bg.config_rules(CFG, bg.Parser(R, ENV), R, ENV)]
         self.assertIn("npm-publish", rules)
         self.assertNotIn("broken", rules)
+
+    def test_example_has_push_main_confirm(self):
+        rule = next(r for r in EXAMPLE["rules"] if r.get("id") == "push-main")
+        self.assertEqual((rule["level"], sorted(rule["push_to"])), ("confirm", ["main", "master"]))
+
+
+class PushTo(unittest.TestCase):
+    """push_to из конфига: свои ветки и уровень, строка вместо списка, битое значение."""
+
+    def decide(self, cmd, rules, cwd=R):
+        return bg.decide(cmd, cwd, dict(CFG, rules=rules), ENV, SSH_CONFIG)
+
+    def test_own_branch_and_level(self):
+        rules = [{"id": "push-dev", "level": "block", "push_to": "dev"}]
+        self.assertEqual(self.decide("git push origin dev", rules)[0], "block")
+        self.assertEqual(self.decide("git push origin main", rules)[0], "allow")
+
+    def test_default_message_names_branches(self):
+        _, hits, _ = self.decide("git push origin main", [{"level": "confirm", "push_to": ["main"]}])
+        self.assertEqual(hits, [("confirm", "push-to", "git push в main")])
+
+    def test_broken_push_to_is_skipped(self):
+        rules = [{"id": "bad", "level": "confirm", "push_to": 5}, *EXAMPLE["rules"]]
+        got, hits, _ = self.decide("git push origin main", rules)
+        self.assertEqual((got, [h[1] for h in hits]), ("confirm", ["push-main"]))
 
 
 class TempDirs(unittest.TestCase):
@@ -294,6 +348,25 @@ class Hook(unittest.TestCase):
 
     def test_garbage_stdin(self):
         self.assertIsNone(self.run_hook(None, stdin="не json"))
+
+    def test_parse_crash_passes_and_logs_command_and_error(self):
+        """Лексер упал: команда проходит (fail-open), в логе — команда (с маской секретов) и ошибка."""
+        crash = ("import importlib.util, sys\n"
+                 f"spec = importlib.util.spec_from_file_location('bash_guard', {GUARD!r})\n"
+                 "bg = importlib.util.module_from_spec(spec); spec.loader.exec_module(bg)\n"
+                 "def lex(src): raise RecursionError('лексер упал')\n"
+                 "bg.lex = lex\n"
+                 "bg.main()\n")
+        cmd = "API_TOKEN=abcd1234efgh rm -rf ~"
+        p = subprocess.run([sys.executable, "-c", crash], capture_output=True, text=True, env=self.env, timeout=20,
+                           input=json.dumps({"tool_input": {"command": cmd}, "cwd": R, "session_id": "s1"}))
+        self.assertEqual((p.returncode, p.stdout.strip()), (0, ""), p.stderr)
+        rec = self.log_lines()[-1]
+        self.assertEqual(rec["decision"], "error")
+        self.assertEqual(rec["error"], "RecursionError: лексер упал")
+        self.assertIn("lex", rec["at"])
+        self.assertEqual(rec["cmd"], "API_TOKEN=*** rm -rf ~")
+        self.assertEqual((rec["session"], rec["cwd"]), ("s1", R))
 
 
 def tearDownModule():
